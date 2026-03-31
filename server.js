@@ -12,9 +12,6 @@ app.use(express.json());
 const PORT = Number(process.env.PORT || 5000);
 const JWT_SECRET = process.env.JWT_SECRET || "supersecretkey";
 
-/* -------------------------
-   Static Menu + Recipe Logic
--------------------------- */
 const PRODUCTS = [
   { id: 1, name: "Americano", category: "Coffee", prices: { "12oz": 60, "16oz": 70, "22oz": 80 } },
   { id: 2, name: "Cafe Latte", category: "Coffee", prices: { "12oz": 80, "16oz": 90, "22oz": 100 } },
@@ -128,9 +125,6 @@ const computeCogs = (needed) => {
   return total;
 };
 
-/* -------------------------
-   Models
--------------------------- */
 const userSchema = new mongoose.Schema(
   {
     username: { type: String, required: true, unique: true },
@@ -187,9 +181,6 @@ const Order = mongoose.model("Order", orderSchema);
 const Alert = mongoose.model("Alert", alertSchema);
 const SupplierDelivery = mongoose.model("SupplierDelivery", supplierDeliverySchema);
 
-/* -------------------------
-   Auth Middleware
--------------------------- */
 const auth = (req, res, next) => {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) return res.status(401).json({ message: "No token" });
@@ -207,9 +198,6 @@ const allowRoles = (...roles) => (req, res, next) => {
   return next();
 };
 
-/* -------------------------
-   Seed Data
--------------------------- */
 async function ensureSeedData() {
   const usersCount = await User.countDocuments();
   if (usersCount === 0) {
@@ -222,21 +210,14 @@ async function ensureSeedData() {
       { username: "admin", passwordHash: adminHash, role: "admin" },
       { username: "staff", passwordHash: staffHash, role: "staff" },
     ]);
-    console.log("Seeded users");
   }
 
   const inv = await Inventory.findOne();
-  if (!inv) {
-    await Inventory.create({ items: INITIAL_INVENTORY });
-    console.log("Seeded inventory");
-  }
+  if (!inv) await Inventory.create({ items: INITIAL_INVENTORY });
 }
 
-/* -------------------------
-   Routes
--------------------------- */
 app.get("/", (req, res) => {
-  res.json({ ok: true, message: "Ohana backend running" });
+  res.json({ ok: true });
 });
 
 app.get("/api/health", (req, res) => {
@@ -445,26 +426,15 @@ app.get("/api/dashboard/owner", auth, allowRoles("owner"), async (req, res) => {
   });
 });
 
-/* -------------------------
-   Start
--------------------------- */
 async function startServer() {
   try {
-    console.log("Loaded server.js");
-    console.log("Has MONGO_URI?", !!process.env.MONGO_URI);
+    if (!process.env.MONGO_URI) throw new Error("MONGO_URI is missing");
 
-    if (!process.env.MONGO_URI) {
-      throw new Error("MONGO_URI is missing in env vars");
-    }
-
-    // Force timeout so we see a clear error instead of hanging forever
     await mongoose.connect(process.env.MONGO_URI, {
       serverSelectionTimeoutMS: 10000,
       connectTimeoutMS: 10000,
       maxPoolSize: 10,
     });
-
-    console.log("MongoDB connected");
 
     await ensureSeedData();
 
@@ -476,13 +446,5 @@ async function startServer() {
     process.exit(1);
   }
 }
-
-process.on("unhandledRejection", (reason) => {
-  console.error("Unhandled Rejection:", reason);
-});
-
-process.on("uncaughtException", (err) => {
-  console.error("Uncaught Exception:", err);
-});
 
 startServer();
