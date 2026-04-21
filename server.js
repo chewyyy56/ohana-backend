@@ -132,25 +132,6 @@ function allowRoles(...roles) {
  * Seed data
  * ------------------------- */
 async function ensureSeedData() {
-  const defaultUsers = [
-    { username: "owner", role: "owner", email: "owner@ohana.local", password: "1234" },
-    { username: "admin", role: "admin", email: "admin@ohana.local", password: "1234" },
-    { username: "staff", role: "staff", email: "staff@ohana.local", password: "1234" },
-  ];
-
-  for (const u of defaultUsers) {
-    const exists = await User.findOne({ username: u.username });
-    if (!exists) {
-      const passwordHash = await bcrypt.hash(u.password, 10);
-      await User.create({
-        username: u.username,
-        role: u.role,
-        email: u.email,
-        passwordHash,
-      });
-    }
-  }
-
   const inv = await Inventory.findOne();
   if (!inv) {
     await Inventory.create({ items: { ...INITIAL_INVENTORY } });
@@ -174,7 +155,7 @@ app.get("/api/health", (_req, res) => {
  * ------------------------- */
 app.post("/api/auth/register", async (req, res) => {
   try {
-    const { username, email = "", password, role = "staff" } = req.body || {};
+    const { username, email = "", password } = req.body || {};
     const uname = String(username || "").trim().toLowerCase();
 
     if (!uname || !password) {
@@ -185,12 +166,11 @@ app.post("/api/auth/register", async (req, res) => {
     if (exists) return res.status(409).json({ ok: false, message: "Username already exists" });
 
     const passwordHash = await bcrypt.hash(String(password), 10);
-    const safeRole = ["owner", "admin", "staff"].includes(role) ? role : "staff";
 
     const user = await User.create({
       username: uname,
       email: String(email || "").trim(),
-      role: safeRole,
+      role: "staff",
       passwordHash,
     });
 
@@ -282,7 +262,6 @@ app.post("/api/orders", auth, async (req, res) => {
     const inv = await Inventory.findOne();
     if (!inv) return res.status(404).json({ ok: false, message: "Inventory not found" });
 
-    // Validate stock availability
     for (const [k, amt] of Object.entries(needed || {})) {
       const required = Number(amt || 0);
       if (required <= 0) continue;
@@ -292,7 +271,6 @@ app.post("/api/orders", auth, async (req, res) => {
       }
     }
 
-    // Deduct stock
     for (const [k, amt] of Object.entries(needed || {})) {
       const required = Number(amt || 0);
       if (required <= 0) continue;
@@ -386,7 +364,14 @@ app.post("/api/supplier-deliveries", auth, allowRoles("owner", "admin"), async (
     const nQty = Number(qty);
     const nCost = Number(cost);
 
-    if (!supplier || !item || !Number.isFinite(nQty) || nQty <= 0 || !Number.isFinite(nCost) || nCost <= 0) {
+    if (
+      !supplier ||
+      !item ||
+      !Number.isFinite(nQty) ||
+      nQty <= 0 ||
+      !Number.isFinite(nCost) ||
+      nCost <= 0
+    ) {
       return res.status(400).json({ ok: false, message: "supplier, item, qty, cost are required" });
     }
 
