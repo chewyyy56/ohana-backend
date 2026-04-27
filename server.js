@@ -6,11 +6,46 @@ const jwt = require("jsonwebtoken");
 require("dotenv").config();
 
 const app = express();
-app.use(cors());
+
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || "supersecretkey";
+const JWT_SECRET = process.env.JWT_SECRET || "";
+const VALID_ROLES = ["owner", "admin", "staff"];
+
+/* -------------------------
+ * Simple in-memory rate limiter
+ * ------------------------- */
+function makeRateLimiter({ windowMs, max }) {
+  const store = new Map();
+
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = `${req.ip}:${req.path}`;
+    const prev = store.get(key);
+
+    if (!prev || now - prev.start > windowMs) {
+      store.set(key, { count: 1, start: now });
+      return next();
+    }
+
+    prev.count += 1;
+    if (prev.count > max) {
+      return res.status(429).json({ ok: false, message: "Too many requests. Please try again later." });
+    }
+
+    return next();
+  };
+}
+
+const loginLimiter = makeRateLimiter({ windowMs: 15 * 60 * 1000, max: 30 });
+const registerLimiter = makeRateLimiter({ windowMs: 60 * 60 * 1000, max: 15 });
 
 /* -------------------------
  * Schemas
@@ -18,9 +53,9 @@ const JWT_SECRET = process.env.JWT_SECRET || "supersecretkey";
 const userSchema = new mongoose.Schema(
   {
     username: { type: String, unique: true, required: true, lowercase: true, trim: true },
-    email: { type: String, default: "" },
+    email: { type: String, default: "", trim: true, lowercase: true },
     passwordHash: { type: String, required: true },
-    role: { type: String, enum: ["owner", "admin", "staff"], default: "staff" },
+    role: { type: String, enum: VALID_ROLES, default: "staff" },
   },
   { timestamps: true }
 );
@@ -34,14 +69,21 @@ const inventorySchema = new mongoose.Schema(
 
 const orderSchema = new mongoose.Schema(
   {
+    groupId: { type: String, index: true, default: "" },
     createdAt: { type: Date, default: Date.now },
     productId: Number,
     productName: String,
     size: String,
-    revenue: { type: Number, default: 0 },
-    cogs: { type: Number, default: 0 },
-    needed: { type: mongoose.Schema.Types.Mixed, default: {} },
+    quantity: { type: Number, default: 1 },
+    revenue: { type: Number, default: 0 }, // total line revenue
+    cogs: { type: Number, default: 0 }, // total line cogs
+    needed: { type: mongoose.Schema.Types.Mixed, default: {} }, // total deducted materials for line
     orderedBy: { type: String, default: "" },
+
+    status: { type: String, enum: ["active", "canceled"], default: "active" },
+    cancelReason: { type: String, default: "" },
+    canceledAt: { type: Date, default: null },
+    canceledBy: { type: String, default: "" },
   },
   { timestamps: true }
 );
@@ -71,11 +113,21 @@ const supplierDeliverySchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+const auditLogSchema = new mongoose.Schema({
+  action: { type: String, required: true },
+  actor: { type: String, default: "" },
+  actorRole: { type: String, default: "" },
+  target: { type: String, default: "" },
+  details: { type: mongoose.Schema.Types.Mixed, default: {} },
+  createdAt: { type: Date, default: Date.now },
+});
+
 const User = mongoose.model("User", userSchema);
 const Inventory = mongoose.model("Inventory", inventorySchema);
 const Order = mongoose.model("Order", orderSchema);
 const Alert = mongoose.model("Alert", alertSchema);
 const SupplierDelivery = mongoose.model("SupplierDelivery", supplierDeliverySchema);
+const AuditLog = mongoose.model("AuditLog", auditLogSchema);
 
 /* -------------------------
  * Defaults
@@ -95,8 +147,16 @@ const INITIAL_INVENTORY = {
 };
 
 /* -------------------------
- * Auth helpers
+ * Helpers
  * ------------------------- */
+function normalizeUsername(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
 function signToken(user) {
   return jwt.sign(
     { id: user._id, username: user.username, role: user.role },
@@ -113,7 +173,7 @@ function auth(req, res, next) {
   try {
     req.user = jwt.verify(token, JWT_SECRET);
     next();
-  } catch (err) {
+  } catch (_err) {
     return res.status(401).json({ ok: false, message: "Invalid token" });
   }
 }
@@ -128,6 +188,80 @@ function allowRoles(...roles) {
   };
 }
 
+function toHttpError(status, message) {
+  const err = new Error(message);
+  err.status = status;
+  return err;
+}
+
+function makeGroupId() {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  const rand = Math.random().toString(36).slice(2, 8).toUpperCase();
+  return `ORD-${y}${m}${d}-${rand}`;
+}
+
+function scaleNeeded(neededPerUnit, quantity) {
+  const out = {};
+  for (const [k, amt] of Object.entries(neededPerUnit || {})) {
+    const n = Number(amt || 0) * Number(quantity || 0);
+    if (n > 0) out[k] = n;
+  }
+  return out;
+}
+
+function normalizeOrderItem(raw) {
+  const productId = Number(raw?.productId);
+  const productName = String(raw?.productName || "").trim();
+  const size = String(raw?.size || "").trim();
+  const quantity = Math.floor(Number(raw?.quantity ?? raw?.qty ?? 1));
+  const revenueUnit = Number(raw?.revenue ?? 0);
+  const cogsUnit = Number(raw?.cogs ?? 0);
+  const neededPerUnit = raw?.neededPerUnit || raw?.needed || {};
+
+  if (!Number.isFinite(productId)) return null;
+  if (!productName || !size) return null;
+  if (!Number.isFinite(quantity) || quantity <= 0) return null;
+  if (!Number.isFinite(revenueUnit) || revenueUnit < 0) return null;
+  if (!Number.isFinite(cogsUnit) || cogsUnit < 0) return null;
+  if (typeof neededPerUnit !== "object" || Array.isArray(neededPerUnit)) return null;
+
+  return {
+    productId,
+    productName,
+    size,
+    quantity,
+    revenueUnit,
+    cogsUnit,
+    neededPerUnit,
+  };
+}
+
+function getBootstrapUsersFromEnv() {
+  return [
+    {
+      username: process.env.SEED_OWNER_USERNAME,
+      password: process.env.SEED_OWNER_PASSWORD,
+      email: process.env.SEED_OWNER_EMAIL || "",
+      role: "owner",
+    },
+    {
+      username: process.env.SEED_ADMIN_USERNAME,
+      password: process.env.SEED_ADMIN_PASSWORD,
+      email: process.env.SEED_ADMIN_EMAIL || "",
+      role: "admin",
+    },
+    {
+      username: process.env.SEED_STAFF_USERNAME,
+      password: process.env.SEED_STAFF_PASSWORD,
+      email: process.env.SEED_STAFF_EMAIL || "",
+      role: "staff",
+    },
+  ];
+}
+
 /* -------------------------
  * Seed data
  * ------------------------- */
@@ -136,45 +270,186 @@ async function ensureSeedData() {
   if (!inv) {
     await Inventory.create({ items: { ...INITIAL_INVENTORY } });
   }
+
+  const seedUsers = getBootstrapUsersFromEnv();
+
+  for (const u of seedUsers) {
+    const uname = normalizeUsername(u.username);
+    const pass = String(u.password || "");
+    if (!uname || !pass) continue;
+
+    const exists = await User.findOne({ username: uname });
+    if (exists) continue;
+
+    const passwordHash = await bcrypt.hash(pass, 10);
+    await User.create({
+      username: uname,
+      email: normalizeEmail(u.email),
+      role: u.role,
+      passwordHash,
+    });
+  }
+}
+
+/* -------------------------
+ * Checkout core (transaction-safe)
+ * ------------------------- */
+async function checkoutCore({ lineItems, actor, actorRole, session }) {
+  if (!Array.isArray(lineItems) || !lineItems.length) {
+    throw toHttpError(400, "No line items.");
+  }
+
+  const normalized = [];
+  const aggregateNeeded = {};
+  let totalAmount = 0;
+  let totalItems = 0;
+
+  for (const raw of lineItems) {
+    const item = normalizeOrderItem(raw);
+    if (!item) throw toHttpError(400, "Invalid item in payload.");
+
+    const neededTotal = scaleNeeded(item.neededPerUnit, item.quantity);
+
+    for (const [k, amt] of Object.entries(neededTotal)) {
+      aggregateNeeded[k] = (aggregateNeeded[k] || 0) + amt;
+    }
+
+    totalAmount += item.revenueUnit * item.quantity;
+    totalItems += item.quantity;
+
+    normalized.push({ ...item, neededTotal });
+  }
+
+  const invDoc = await Inventory.findOne().session(session);
+  if (!invDoc) throw toHttpError(404, "Inventory not found");
+
+  for (const [k, required] of Object.entries(aggregateNeeded)) {
+    const onHand = Number(invDoc.items[k] || 0);
+    if (onHand < required) {
+      throw toHttpError(400, `Not enough ${k}`);
+    }
+  }
+
+  const filter = { _id: invDoc._id };
+  const incMap = {};
+
+  for (const [k, required] of Object.entries(aggregateNeeded)) {
+    filter[`items.${k}`] = { $gte: required };
+    incMap[`items.${k}`] = -required;
+  }
+
+  const updatedInventory =
+    Object.keys(incMap).length > 0
+      ? await Inventory.findOneAndUpdate(filter, { $inc: incMap }, { new: true, session })
+      : invDoc;
+
+  if (!updatedInventory) {
+    throw toHttpError(409, "Stock changed while checking out. Please retry.");
+  }
+
+  const groupId = makeGroupId();
+  const now = new Date();
+
+  const docs = normalized.map((item) => ({
+    groupId,
+    createdAt: now,
+    productId: item.productId,
+    productName: item.productName,
+    size: item.size,
+    quantity: item.quantity,
+    revenue: item.revenueUnit * item.quantity,
+    cogs: item.cogsUnit * item.quantity,
+    needed: item.neededTotal,
+    orderedBy: actor,
+    status: "active",
+  }));
+
+  const createdOrders = await Order.insertMany(docs, { session });
+
+  const groupSummary = {
+    groupId,
+    status: "active",
+    orderedBy: actor,
+    createdAt: now,
+    totalItems,
+    totalAmount,
+    items: createdOrders.map((o) => ({
+      id: o._id,
+      productId: o.productId,
+      productName: o.productName,
+      size: o.size,
+      quantity: o.quantity,
+      revenue: o.revenue,
+      cogs: o.cogs,
+      status: o.status,
+    })),
+  };
+
+  await AuditLog.create(
+    [
+      {
+        action: "checkout_group",
+        actor,
+        actorRole,
+        target: groupId,
+        details: {
+          lines: createdOrders.length,
+          totalItems,
+          totalAmount,
+        },
+        createdAt: now,
+      },
+    ],
+    { session }
+  );
+
+  return { updatedInventory, createdOrders, groupSummary };
 }
 
 /* -------------------------
  * Basic routes
  * ------------------------- */
 app.get("/", (_req, res) => {
-  res.json({ ok: true });
+  res.json({ ok: true, service: "ohana-backend" });
 });
 
 app.get("/api/health", (_req, res) => {
-  const mongoState = mongoose.connection.readyState; // 1 = connected
+  const mongoState = mongoose.connection.readyState;
   res.json({ ok: true, mongoState });
 });
 
 /* -------------------------
  * Auth routes
  * ------------------------- */
-app.post("/api/auth/register", async (req, res) => {
+app.post("/api/auth/register", registerLimiter, async (req, res) => {
   try {
-    const { username, email = "", password } = req.body || {};
-    const uname = String(username || "").trim().toLowerCase();
+    const username = normalizeUsername(req.body?.username);
+    const email = normalizeEmail(req.body?.email);
+    const password = String(req.body?.password || "");
 
-    if (!uname || !password) {
-      return res.status(400).json({ ok: false, message: "Username and password are required" });
+    if (!username || !email || !password) {
+      return res.status(400).json({ ok: false, message: "Username, email, and password are required" });
     }
 
-    const exists = await User.findOne({ username: uname });
-    if (exists) return res.status(409).json({ ok: false, message: "Username already exists" });
+    if (password.length < 6) {
+      return res.status(400).json({ ok: false, message: "Password must be at least 6 characters" });
+    }
 
-    const passwordHash = await bcrypt.hash(String(password), 10);
+    const usernameTaken = await User.findOne({ username });
+    if (usernameTaken) return res.status(409).json({ ok: false, message: "Username already exists" });
+
+    const emailTaken = await User.findOne({ email });
+    if (emailTaken) return res.status(409).json({ ok: false, message: "Email already exists" });
 
     const user = await User.create({
-      username: uname,
-      email: String(email || "").trim(),
+      username,
+      email,
       role: "staff",
-      passwordHash,
+      passwordHash: await bcrypt.hash(password, 10),
     });
 
     const token = signToken(user);
+
     res.status(201).json({
       ok: true,
       token,
@@ -185,16 +460,15 @@ app.post("/api/auth/register", async (req, res) => {
   }
 });
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", loginLimiter, async (req, res) => {
   try {
-    const { username, password } = req.body || {};
-    const uname = String(username || "").trim().toLowerCase();
-    const pass = String(password || "");
+    const username = normalizeUsername(req.body?.username);
+    const password = String(req.body?.password || "");
 
-    const user = await User.findOne({ username: uname });
+    const user = await User.findOne({ username });
     if (!user) return res.status(401).json({ ok: false, message: "Invalid username or password" });
 
-    const match = await bcrypt.compare(pass, user.passwordHash);
+    const match = await bcrypt.compare(password, user.passwordHash);
     if (!match) return res.status(401).json({ ok: false, message: "Invalid username or password" });
 
     const token = signToken(user);
@@ -223,19 +497,28 @@ app.get("/api/inventory", auth, async (_req, res) => {
 
 app.patch("/api/inventory/restock", auth, allowRoles("admin", "owner"), async (req, res) => {
   try {
-    const { materialKey, qty } = req.body || {};
-    const nQty = Number(qty);
+    const materialKey = String(req.body?.materialKey || "");
+    const qty = Number(req.body?.qty);
 
-    if (!materialKey || !Number.isFinite(nQty) || nQty <= 0) {
+    if (!materialKey || !Number.isFinite(qty) || qty <= 0) {
       return res.status(400).json({ ok: false, message: "materialKey and positive qty are required" });
     }
 
     const inv = await Inventory.findOne();
     if (!inv) return res.status(404).json({ ok: false, message: "Inventory not found" });
 
-    inv.items[materialKey] = Number(inv.items[materialKey] || 0) + nQty;
+    inv.items[materialKey] = Number(inv.items[materialKey] || 0) + qty;
     inv.markModified("items");
     await inv.save();
+
+    await AuditLog.create({
+      action: "restock_material",
+      actor: req.user.username,
+      actorRole: req.user.role,
+      target: materialKey,
+      details: { qty },
+      createdAt: new Date(),
+    });
 
     res.json({ ok: true, inventory: inv.items });
   } catch (err) {
@@ -255,44 +538,251 @@ app.get("/api/orders", auth, allowRoles("owner", "admin"), async (_req, res) => 
   }
 });
 
-app.post("/api/orders", auth, async (req, res) => {
+// staff-facing grouped orders
+app.get("/api/orders/staff", auth, allowRoles("staff", "admin", "owner"), async (req, res) => {
   try {
-    const { productId, productName, size, revenue = 0, cogs = 0, needed = {} } = req.body || {};
+    const qUser =
+      req.user.role === "staff"
+        ? req.user.username
+        : normalizeUsername(req.query.username || req.user.username);
 
-    const inv = await Inventory.findOne();
-    if (!inv) return res.status(404).json({ ok: false, message: "Inventory not found" });
+    const docs = await Order.find({
+      orderedBy: qUser,
+      groupId: { $ne: "" },
+    })
+      .sort({ createdAt: -1 })
+      .limit(1500);
 
-    for (const [k, amt] of Object.entries(needed || {})) {
-      const required = Number(amt || 0);
-      if (required <= 0) continue;
-      const onHand = Number(inv.items[k] || 0);
-      if (onHand < required) {
-        return res.status(400).json({ ok: false, message: `Not enough ${k}` });
+    const map = new Map();
+
+    for (const o of docs) {
+      const gid = o.groupId || String(o._id);
+
+      if (!map.has(gid)) {
+        map.set(gid, {
+          groupId: gid,
+          createdAt: o.createdAt,
+          orderedBy: o.orderedBy,
+          status: o.status,
+          totalItems: 0,
+          totalAmount: 0,
+          items: [],
+          canceledAt: o.canceledAt || null,
+          canceledBy: o.canceledBy || "",
+          cancelReason: o.cancelReason || "",
+        });
+      }
+
+      const g = map.get(gid);
+      g.totalItems += Number(o.quantity || 1);
+      g.totalAmount += Number(o.revenue || 0);
+      if (o.status === "active") g.status = "active";
+      if (o.status === "canceled" && g.status !== "active") g.status = "canceled";
+      if (o.canceledAt && !g.canceledAt) g.canceledAt = o.canceledAt;
+      if (o.canceledBy && !g.canceledBy) g.canceledBy = o.canceledBy;
+      if (o.cancelReason && !g.cancelReason) g.cancelReason = o.cancelReason;
+
+      g.items.push({
+        id: o._id,
+        productId: o.productId,
+        productName: o.productName,
+        size: o.size,
+        quantity: o.quantity,
+        revenue: o.revenue,
+        cogs: o.cogs,
+        status: o.status,
+      });
+    }
+
+    const groups = Array.from(map.values()).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    res.json({ ok: true, groups: groups.slice(0, 50) });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+// single-line legacy checkout (compat)
+app.post("/api/orders", auth, async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    session.startTransaction();
+
+    const item = normalizeOrderItem(req.body || {});
+    if (!item) throw toHttpError(400, "Invalid order payload");
+
+    const { updatedInventory, createdOrders, groupSummary } = await checkoutCore({
+      lineItems: [item],
+      actor: req.user.username,
+      actorRole: req.user.role,
+      session,
+    });
+
+    await session.commitTransaction();
+
+    res.status(201).json({
+      ok: true,
+      order: createdOrders[0],
+      group: groupSummary,
+      inventory: updatedInventory.items,
+    });
+  } catch (err) {
+    await session.abortTransaction();
+    res.status(err.status || 500).json({ ok: false, message: err.message });
+  } finally {
+    session.endSession();
+  }
+});
+
+// multi-line checkout
+app.post("/api/orders/checkout", auth, async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    session.startTransaction();
+
+    const lineItems = Array.isArray(req.body?.items) ? req.body.items : [];
+    const { updatedInventory, createdOrders, groupSummary } = await checkoutCore({
+      lineItems,
+      actor: req.user.username,
+      actorRole: req.user.role,
+      session,
+    });
+
+    await session.commitTransaction();
+
+    res.status(201).json({
+      ok: true,
+      group: groupSummary,
+      orders: createdOrders,
+      inventory: updatedInventory.items,
+    });
+  } catch (err) {
+    await session.abortTransaction();
+    res.status(err.status || 500).json({ ok: false, message: err.message });
+  } finally {
+    session.endSession();
+  }
+});
+
+// cancel order group (staff own group within 10 mins, admin/owner anytime)
+app.patch("/api/orders/group/:groupId/cancel", auth, allowRoles("staff", "admin", "owner"), async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    session.startTransaction();
+
+    const groupId = String(req.params.groupId || "").trim();
+    const reason = String(req.body?.reason || "Customer changed mind").trim();
+
+    if (!groupId) throw toHttpError(400, "groupId is required");
+
+    const activeOrders = await Order.find({ groupId, status: "active" }).session(session);
+    if (!activeOrders.length) throw toHttpError(404, "No active orders found for this group");
+
+    const orderedBy = activeOrders[0].orderedBy;
+    const createdAt = activeOrders[0].createdAt;
+
+    if (req.user.role === "staff") {
+      if (orderedBy !== req.user.username) {
+        throw toHttpError(403, "Staff can only cancel their own order group");
+      }
+      const TEN_MIN = 10 * 60 * 1000;
+      if (Date.now() - new Date(createdAt).getTime() > TEN_MIN) {
+        throw toHttpError(403, "Staff cancel window expired. Ask admin/owner.");
       }
     }
 
-    for (const [k, amt] of Object.entries(needed || {})) {
-      const required = Number(amt || 0);
-      if (required <= 0) continue;
-      inv.items[k] = Math.max(0, Number(inv.items[k] || 0) - required);
+    const restoreMap = {};
+    let totalItems = 0;
+    let totalAmount = 0;
+
+    for (const o of activeOrders) {
+      totalItems += Number(o.quantity || 1);
+      totalAmount += Number(o.revenue || 0);
+      for (const [k, v] of Object.entries(o.needed || {})) {
+        restoreMap[k] = (restoreMap[k] || 0) + Number(v || 0);
+      }
     }
-    inv.markModified("items");
-    await inv.save();
 
-    const order = await Order.create({
-      createdAt: new Date(),
-      productId,
-      productName,
-      size,
-      revenue: Number(revenue || 0),
-      cogs: Number(cogs || 0),
-      needed,
-      orderedBy: req.user.username,
+    const invDoc = await Inventory.findOne().session(session);
+    if (!invDoc) throw toHttpError(404, "Inventory not found");
+
+    const incMap = {};
+    for (const [k, v] of Object.entries(restoreMap)) {
+      if (v > 0) incMap[`items.${k}`] = v;
+    }
+
+    const updatedInventory =
+      Object.keys(incMap).length > 0
+        ? await Inventory.findOneAndUpdate({ _id: invDoc._id }, { $inc: incMap }, { new: true, session })
+        : invDoc;
+
+    await Order.updateMany(
+      { groupId, status: "active" },
+      {
+        $set: {
+          status: "canceled",
+          canceledAt: new Date(),
+          canceledBy: req.user.username,
+          cancelReason: reason,
+        },
+      },
+      { session }
+    );
+
+    const finalOrders = await Order.find({ groupId }).session(session);
+
+    const group = {
+      groupId,
+      createdAt,
+      orderedBy,
+      status: "canceled",
+      totalItems,
+      totalAmount,
+      canceledAt: new Date(),
+      canceledBy: req.user.username,
+      cancelReason: reason,
+      items: finalOrders.map((o) => ({
+        id: o._id,
+        productId: o.productId,
+        productName: o.productName,
+        size: o.size,
+        quantity: o.quantity,
+        revenue: o.revenue,
+        cogs: o.cogs,
+        status: o.status,
+      })),
+    };
+
+    await AuditLog.create(
+      [
+        {
+          action: "cancel_group",
+          actor: req.user.username,
+          actorRole: req.user.role,
+          target: groupId,
+          details: {
+            reason,
+            totalItems,
+            totalAmount,
+          },
+          createdAt: new Date(),
+        },
+      ],
+      { session }
+    );
+
+    await session.commitTransaction();
+
+    res.json({
+      ok: true,
+      message: "Order group canceled.",
+      group,
+      inventory: updatedInventory.items,
     });
-
-    res.status(201).json({ ok: true, order, inventory: inv.items });
   } catch (err) {
-    res.status(500).json({ ok: false, message: err.message });
+    await session.abortTransaction();
+    res.status(err.status || 500).json({ ok: false, message: err.message });
+  } finally {
+    session.endSession();
   }
 });
 
@@ -310,7 +800,10 @@ app.get("/api/alerts", auth, allowRoles("admin", "owner"), async (_req, res) => 
 
 app.post("/api/alerts", auth, async (req, res) => {
   try {
-    const { materialKey, message, severity = "Yellow" } = req.body || {};
+    const materialKey = String(req.body?.materialKey || "");
+    const message = String(req.body?.message || "");
+    const severity = String(req.body?.severity || "Yellow");
+
     if (!materialKey || !message) {
       return res.status(400).json({ ok: false, message: "materialKey and message are required" });
     }
@@ -331,8 +824,7 @@ app.post("/api/alerts", auth, async (req, res) => {
 
 app.patch("/api/alerts/:id/clear", auth, allowRoles("admin", "owner"), async (req, res) => {
   try {
-    const { id } = req.params;
-    const alert = await Alert.findById(id);
+    const alert = await Alert.findById(req.params.id);
     if (!alert) return res.status(404).json({ ok: false, message: "Alert not found" });
 
     alert.cleared = true;
@@ -360,27 +852,30 @@ app.get("/api/supplier-deliveries", auth, allowRoles("owner", "admin"), async (_
 
 app.post("/api/supplier-deliveries", auth, allowRoles("owner", "admin"), async (req, res) => {
   try {
-    const { supplier, item, qty, cost } = req.body || {};
-    const nQty = Number(qty);
-    const nCost = Number(cost);
+    const supplier = String(req.body?.supplier || "").trim();
+    const item = String(req.body?.item || "").trim();
+    const qty = Number(req.body?.qty);
+    const cost = Number(req.body?.cost);
 
-    if (
-      !supplier ||
-      !item ||
-      !Number.isFinite(nQty) ||
-      nQty <= 0 ||
-      !Number.isFinite(nCost) ||
-      nCost <= 0
-    ) {
+    if (!supplier || !item || !Number.isFinite(qty) || qty <= 0 || !Number.isFinite(cost) || cost <= 0) {
       return res.status(400).json({ ok: false, message: "supplier, item, qty, cost are required" });
     }
 
     const delivery = await SupplierDelivery.create({
       supplier,
       item,
-      qty: nQty,
-      cost: nCost,
+      qty,
+      cost,
       createdBy: req.user.username,
+      createdAt: new Date(),
+    });
+
+    await AuditLog.create({
+      action: "add_supplier_delivery",
+      actor: req.user.username,
+      actorRole: req.user.role,
+      target: delivery._id.toString(),
+      details: { supplier, item, qty, cost },
       createdAt: new Date(),
     });
 
@@ -391,11 +886,20 @@ app.post("/api/supplier-deliveries", auth, allowRoles("owner", "admin"), async (
 });
 
 /* -------------------------
- * Owner dashboard summary
+ * Audit + Owner dashboard
  * ------------------------- */
+app.get("/api/audit-logs", auth, allowRoles("owner"), async (_req, res) => {
+  try {
+    const logs = await AuditLog.find().sort({ createdAt: -1 }).limit(300);
+    res.json({ ok: true, logs });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
 app.get("/api/dashboard/owner", auth, allowRoles("owner"), async (_req, res) => {
   try {
-    const orders = await Order.find();
+    const orders = await Order.find({ status: "active" });
     const deliveries = await SupplierDelivery.find();
 
     const totalSales = orders.reduce((s, o) => s + Number(o.revenue || 0), 0);
@@ -427,6 +931,9 @@ app.get("/api/dashboard/owner", auth, allowRoles("owner"), async (_req, res) => 
 async function startServer() {
   try {
     if (!process.env.MONGO_URI) throw new Error("MONGO_URI is missing");
+    if (!JWT_SECRET || JWT_SECRET.length < 16) {
+      throw new Error("JWT_SECRET must be set and at least 16 characters");
+    }
 
     await mongoose.connect(process.env.MONGO_URI, {
       serverSelectionTimeoutMS: 10000,
