@@ -18,6 +18,8 @@ app.use(express.json());
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || "";
 const VALID_ROLES = ["owner", "admin", "staff"];
+const ORDER_STATUSES = ["active", "processing", "ready", "completed", "canceled"];
+const OPEN_ORDER_STATUSES = ["active", "processing", "ready"];
 
 /* -------------------------
  * Simple in-memory rate limiter
@@ -81,7 +83,7 @@ const orderSchema = new mongoose.Schema(
     needed: { type: mongoose.Schema.Types.Mixed, default: {} }, // total deducted materials for line
     orderedBy: { type: String, default: "" },
 
-    status: { type: String, enum: ["active", "canceled"], default: "active" },
+    status: { type: String, enum: ORDER_STATUSES, default: "processing" },
     cancelReason: { type: String, default: "" },
     canceledAt: { type: Date, default: null },
     canceledBy: { type: String, default: "" },
@@ -258,6 +260,41 @@ function normalizeOrderItem(raw) {
   };
 }
 
+function summarizeOrderGroup(orders) {
+  const list = Array.isArray(orders) ? orders : [];
+  const first = list[0] || {};
+  const statuses = new Set(list.map((o) => o.status || "active"));
+  const status = statuses.has("processing") || statuses.has("active")
+    ? "processing"
+    : statuses.has("ready")
+      ? "ready"
+      : statuses.has("completed")
+        ? "completed"
+        : "canceled";
+
+  return {
+    groupId: first.groupId || String(first._id || ""),
+    createdAt: first.createdAt,
+    orderedBy: first.orderedBy || "",
+    status,
+    totalItems: list.reduce((sum, o) => sum + Number(o.quantity || 1), 0),
+    totalAmount: list.reduce((sum, o) => sum + Number(o.revenue || 0), 0),
+    canceledAt: first.canceledAt || null,
+    canceledBy: first.canceledBy || "",
+    cancelReason: first.cancelReason || "",
+    items: list.map((o) => ({
+      id: o._id,
+      productId: o.productId,
+      productName: o.productName,
+      size: o.size,
+      quantity: o.quantity,
+      revenue: o.revenue,
+      cogs: o.cogs,
+      status: o.status || "active",
+    })),
+  };
+}
+
 function getBootstrapUsersFromEnv() {
   return [
     {
@@ -380,14 +417,14 @@ async function checkoutCore({ lineItems, actor, actorRole, session }) {
     cogs: item.cogsUnit * item.quantity,
     needed: item.neededTotal,
     orderedBy: actor,
-    status: "active",
+    status: "processing",
   }));
 
   const createdOrders = await Order.insertMany(docs, { session });
 
   const groupSummary = {
     groupId,
-    status: "active",
+    status: "processing",
     orderedBy: actor,
     createdAt: now,
     totalItems,
@@ -713,6 +750,7 @@ app.get("/api/orders", auth, allowRoles("owner", "admin"), async (_req, res) => 
 app.get("/api/orders/staff", auth, allowRoles("staff", "admin", "owner"), async (req, res) => {
   try {
     const includeCanceled = String(req.query.includeCanceled || "") === "true";
+    const historyOnly = String(req.query.history || "") === "true";
     const filter = { groupId: { $ne: "" } };
 
     if (req.user.role === "staff") {
@@ -721,8 +759,10 @@ app.get("/api/orders/staff", auth, allowRoles("staff", "admin", "owner"), async 
       filter.orderedBy = normalizeUsername(req.query.username);
     }
 
-    if (!includeCanceled) {
-      filter.status = "active";
+    if (historyOnly) {
+      filter.status = { $in: ["completed", "canceled"] };
+    } else if (!includeCanceled) {
+      filter.status = { $in: OPEN_ORDER_STATUSES };
     }
 
     const docs = await Order.find(filter)
@@ -739,7 +779,7 @@ app.get("/api/orders/staff", auth, allowRoles("staff", "admin", "owner"), async 
           groupId: gid,
           createdAt: o.createdAt,
           orderedBy: o.orderedBy,
-          status: o.status,
+          status: o.status || "active",
           totalItems: 0,
           totalAmount: 0,
           items: [],
@@ -752,8 +792,10 @@ app.get("/api/orders/staff", auth, allowRoles("staff", "admin", "owner"), async 
       const g = map.get(gid);
       g.totalItems += Number(o.quantity || 1);
       g.totalAmount += Number(o.revenue || 0);
-      if (o.status === "active") g.status = "active";
-      if (o.status === "canceled" && g.status !== "active") g.status = "canceled";
+      if (["active", "processing"].includes(o.status) || !o.status) g.status = "processing";
+      if (o.status === "ready" && !["processing"].includes(g.status)) g.status = "ready";
+      if (o.status === "completed" && !["processing", "ready"].includes(g.status)) g.status = "completed";
+      if (o.status === "canceled" && !["processing", "ready", "completed"].includes(g.status)) g.status = "canceled";
       if (o.canceledAt && !g.canceledAt) g.canceledAt = o.canceledAt;
       if (o.canceledBy && !g.canceledBy) g.canceledBy = o.canceledBy;
       if (o.cancelReason && !g.cancelReason) g.cancelReason = o.cancelReason;
@@ -839,6 +881,48 @@ app.post("/api/orders/checkout", auth, async (req, res) => {
   }
 });
 
+// update preparation status (processing -> ready -> completed)
+app.patch("/api/orders/group/:groupId/status", auth, allowRoles("staff", "admin", "owner"), async (req, res) => {
+  try {
+    const groupId = String(req.params.groupId || "").trim();
+    const status = String(req.body?.status || "").trim();
+
+    if (!groupId) return res.status(400).json({ ok: false, message: "groupId is required" });
+    if (!["processing", "ready", "completed"].includes(status)) {
+      return res.status(400).json({ ok: false, message: "Invalid order status" });
+    }
+
+    const orders = await Order.find({ groupId });
+    if (!orders.length) return res.status(404).json({ ok: false, message: "Order group not found" });
+
+    const orderedBy = orders[0].orderedBy;
+    if (req.user.role === "staff" && orderedBy !== req.user.username) {
+      return res.status(403).json({ ok: false, message: "Staff can only update their own order group" });
+    }
+
+    if (orders.some((o) => o.status === "canceled")) {
+      return res.status(400).json({ ok: false, message: "Canceled orders cannot be updated" });
+    }
+
+    await Order.updateMany({ groupId }, { $set: { status } });
+    const updatedOrders = await Order.find({ groupId });
+    const group = summarizeOrderGroup(updatedOrders);
+
+    await AuditLog.create({
+      action: "update_order_status",
+      actor: req.user.username,
+      actorRole: req.user.role,
+      target: groupId,
+      details: { status },
+      createdAt: new Date(),
+    });
+
+    res.json({ ok: true, group });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
 // cancel order group (staff own group, admin/owner any group)
 app.patch("/api/orders/group/:groupId/cancel", auth, allowRoles("staff", "admin", "owner"), async (req, res) => {
   const session = await mongoose.startSession();
@@ -850,7 +934,7 @@ app.patch("/api/orders/group/:groupId/cancel", auth, allowRoles("staff", "admin"
 
     if (!groupId) throw toHttpError(400, "groupId is required");
 
-    const activeOrders = await Order.find({ groupId, status: "active" }).session(session);
+    const activeOrders = await Order.find({ groupId, status: { $in: OPEN_ORDER_STATUSES } }).session(session);
     if (!activeOrders.length) throw toHttpError(404, "No active orders found for this group");
 
     const orderedBy = activeOrders[0].orderedBy;
@@ -888,7 +972,7 @@ app.patch("/api/orders/group/:groupId/cancel", auth, allowRoles("staff", "admin"
         : invDoc;
 
     await Order.updateMany(
-      { groupId, status: "active" },
+      { groupId, status: { $in: OPEN_ORDER_STATUSES } },
       {
         $set: {
           status: "canceled",
@@ -1071,7 +1155,7 @@ app.get("/api/audit-logs", auth, allowRoles("owner"), async (_req, res) => {
 
 app.get("/api/dashboard/owner", auth, allowRoles("owner"), async (_req, res) => {
   try {
-    const orders = await Order.find({ status: "active" });
+    const orders = await Order.find({ status: { $ne: "canceled" } });
     const deliveries = await SupplierDelivery.find();
 
     const totalSales = orders.reduce((s, o) => s + Number(o.revenue || 0), 0);
