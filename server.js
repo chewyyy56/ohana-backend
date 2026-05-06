@@ -56,6 +56,7 @@ const userSchema = new mongoose.Schema(
     email: { type: String, default: "", trim: true, lowercase: true },
     passwordHash: { type: String, required: true },
     role: { type: String, enum: VALID_ROLES, default: "staff" },
+    active: { type: Boolean, default: true },
   },
   { timestamps: true }
 );
@@ -185,6 +186,24 @@ function allowRoles(...roles) {
       return res.status(403).json({ ok: false, message: "Forbidden" });
     }
     next();
+  };
+}
+
+function manageableRolesFor(role) {
+  if (role === "owner") return ["admin", "staff"];
+  if (role === "admin") return ["staff"];
+  return [];
+}
+
+function publicUser(user) {
+  return {
+    id: user._id,
+    username: user.username,
+    email: user.email,
+    role: user.role,
+    active: user.active !== false,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt,
   };
 }
 
@@ -467,6 +486,9 @@ app.post("/api/auth/login", loginLimiter, async (req, res) => {
 
     const user = await User.findOne({ username });
     if (!user) return res.status(401).json({ ok: false, message: "Invalid username or password" });
+    if (user.active === false) {
+      return res.status(401).json({ ok: false, message: "This account is no longer active" });
+    }
 
     const match = await bcrypt.compare(password, user.passwordHash);
     if (!match) return res.status(401).json({ ok: false, message: "Invalid username or password" });
@@ -478,6 +500,155 @@ app.post("/api/auth/login", loginLimiter, async (req, res) => {
       token,
       user: { id: user._id, username: user.username, role: user.role, email: user.email },
     });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+/* -------------------------
+ * Staff account management
+ * ------------------------- */
+app.get("/api/users", auth, allowRoles("admin", "owner"), async (req, res) => {
+  try {
+    const roles = manageableRolesFor(req.user.role);
+    const users = await User.find({ role: { $in: roles } }).sort({ role: 1, username: 1 });
+    res.json({ ok: true, users: users.map(publicUser) });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+app.post("/api/users", auth, allowRoles("admin", "owner"), async (req, res) => {
+  try {
+    const roles = manageableRolesFor(req.user.role);
+    const username = normalizeUsername(req.body?.username);
+    const email = normalizeEmail(req.body?.email);
+    const password = String(req.body?.password || "");
+    const role = String(req.body?.role || "staff");
+
+    if (!roles.includes(role)) {
+      return res.status(403).json({ ok: false, message: "You cannot create that account role" });
+    }
+    if (!username || !password) {
+      return res.status(400).json({ ok: false, message: "Username and password are required" });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ ok: false, message: "Password must be at least 6 characters" });
+    }
+
+    const usernameTaken = await User.findOne({ username });
+    if (usernameTaken) return res.status(409).json({ ok: false, message: "Username already exists" });
+
+    if (email) {
+      const emailTaken = await User.findOne({ email });
+      if (emailTaken) return res.status(409).json({ ok: false, message: "Email already exists" });
+    }
+
+    const user = await User.create({
+      username,
+      email,
+      role,
+      active: true,
+      passwordHash: await bcrypt.hash(password, 10),
+    });
+
+    await AuditLog.create({
+      action: "create_user",
+      actor: req.user.username,
+      actorRole: req.user.role,
+      target: user.username,
+      details: { role: user.role },
+      createdAt: new Date(),
+    });
+
+    res.status(201).json({ ok: true, user: publicUser(user) });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+app.patch("/api/users/:id", auth, allowRoles("admin", "owner"), async (req, res) => {
+  try {
+    const roles = manageableRolesFor(req.user.role);
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ ok: false, message: "User not found" });
+    if (!roles.includes(user.role)) {
+      return res.status(403).json({ ok: false, message: "You cannot edit that account" });
+    }
+
+    const nextRole = req.body?.role ? String(req.body.role) : user.role;
+    if (!roles.includes(nextRole)) {
+      return res.status(403).json({ ok: false, message: "You cannot assign that account role" });
+    }
+
+    const nextUsername = req.body?.username !== undefined ? normalizeUsername(req.body.username) : user.username;
+    const nextEmail = req.body?.email !== undefined ? normalizeEmail(req.body.email) : user.email;
+    const nextPassword = String(req.body?.password || "");
+
+    if (!nextUsername) {
+      return res.status(400).json({ ok: false, message: "Username is required" });
+    }
+
+    const usernameTaken = await User.findOne({ username: nextUsername, _id: { $ne: user._id } });
+    if (usernameTaken) return res.status(409).json({ ok: false, message: "Username already exists" });
+
+    if (nextEmail) {
+      const emailTaken = await User.findOne({ email: nextEmail, _id: { $ne: user._id } });
+      if (emailTaken) return res.status(409).json({ ok: false, message: "Email already exists" });
+    }
+
+    if (nextPassword) {
+      if (nextPassword.length < 6) {
+        return res.status(400).json({ ok: false, message: "Password must be at least 6 characters" });
+      }
+      user.passwordHash = await bcrypt.hash(nextPassword, 10);
+    }
+
+    user.username = nextUsername;
+    user.email = nextEmail;
+    user.role = nextRole;
+    if (req.body?.active !== undefined) user.active = Boolean(req.body.active);
+    await user.save();
+
+    await AuditLog.create({
+      action: "update_user",
+      actor: req.user.username,
+      actorRole: req.user.role,
+      target: user.username,
+      details: { role: user.role, active: user.active !== false },
+      createdAt: new Date(),
+    });
+
+    res.json({ ok: true, user: publicUser(user) });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+app.delete("/api/users/:id", auth, allowRoles("admin", "owner"), async (req, res) => {
+  try {
+    const roles = manageableRolesFor(req.user.role);
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ ok: false, message: "User not found" });
+    if (!roles.includes(user.role)) {
+      return res.status(403).json({ ok: false, message: "You cannot delete that account" });
+    }
+    if (String(user._id) === String(req.user.id)) {
+      return res.status(400).json({ ok: false, message: "You cannot delete your own account" });
+    }
+
+    await User.deleteOne({ _id: user._id });
+
+    await AuditLog.create({
+      action: "delete_user",
+      actor: req.user.username,
+      actorRole: req.user.role,
+      target: user.username,
+      details: { role: user.role },
+      createdAt: new Date(),
+    });
+
+    res.json({ ok: true, message: "Account deleted", user: publicUser(user) });
   } catch (err) {
     res.status(500).json({ ok: false, message: err.message });
   }
