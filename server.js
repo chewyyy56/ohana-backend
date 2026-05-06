@@ -541,15 +541,20 @@ app.get("/api/orders", auth, allowRoles("owner", "admin"), async (_req, res) => 
 // staff-facing grouped orders
 app.get("/api/orders/staff", auth, allowRoles("staff", "admin", "owner"), async (req, res) => {
   try {
-    const qUser =
-      req.user.role === "staff"
-        ? req.user.username
-        : normalizeUsername(req.query.username || req.user.username);
+    const includeCanceled = String(req.query.includeCanceled || "") === "true";
+    const filter = { groupId: { $ne: "" } };
 
-    const docs = await Order.find({
-      orderedBy: qUser,
-      groupId: { $ne: "" },
-    })
+    if (req.user.role === "staff") {
+      filter.orderedBy = req.user.username;
+    } else if (req.query.username) {
+      filter.orderedBy = normalizeUsername(req.query.username);
+    }
+
+    if (!includeCanceled) {
+      filter.status = "active";
+    }
+
+    const docs = await Order.find(filter)
       .sort({ createdAt: -1 })
       .limit(1500);
 
@@ -663,7 +668,7 @@ app.post("/api/orders/checkout", auth, async (req, res) => {
   }
 });
 
-// cancel order group (staff own group within 10 mins, admin/owner anytime)
+// cancel order group (staff own group, admin/owner any group)
 app.patch("/api/orders/group/:groupId/cancel", auth, allowRoles("staff", "admin", "owner"), async (req, res) => {
   const session = await mongoose.startSession();
   try {
@@ -683,10 +688,6 @@ app.patch("/api/orders/group/:groupId/cancel", auth, allowRoles("staff", "admin"
     if (req.user.role === "staff") {
       if (orderedBy !== req.user.username) {
         throw toHttpError(403, "Staff can only cancel their own order group");
-      }
-      const TEN_MIN = 10 * 60 * 1000;
-      if (Date.now() - new Date(createdAt).getTime() > TEN_MIN) {
-        throw toHttpError(403, "Staff cancel window expired. Ask admin/owner.");
       }
     }
 
