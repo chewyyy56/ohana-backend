@@ -576,7 +576,7 @@ app.post("/api/auth/login", loginLimiter, async (req, res) => {
   }
 });
 
-app.get("/api/staff-signup-code", auth, allowRoles("admin", "owner"), async (_req, res) => {
+app.get("/api/staff-signup-code", auth, allowRoles("admin"), async (_req, res) => {
   try {
     const setting = await Setting.findOneAndUpdate(
       { key: "staffSignupCode" },
@@ -590,7 +590,7 @@ app.get("/api/staff-signup-code", auth, allowRoles("admin", "owner"), async (_re
   }
 });
 
-app.patch("/api/staff-signup-code", auth, allowRoles("admin", "owner"), async (req, res) => {
+app.patch("/api/staff-signup-code", auth, allowRoles("admin"), async (req, res) => {
   try {
     const requestedCode = normalizeSignupCode(req.body?.code);
     const nextCode = requestedCode || generateSignupCode();
@@ -633,7 +633,7 @@ app.get("/api/users", auth, allowRoles("admin", "owner"), async (req, res) => {
   }
 });
 
-app.post("/api/users", auth, allowRoles("admin", "owner"), async (req, res) => {
+app.post("/api/users", auth, allowRoles("admin"), async (req, res) => {
   try {
     const roles = manageableRolesFor(req.user.role);
     const username = normalizeUsername(req.body?.username);
@@ -682,7 +682,7 @@ app.post("/api/users", auth, allowRoles("admin", "owner"), async (req, res) => {
   }
 });
 
-app.patch("/api/users/:id", auth, allowRoles("admin", "owner"), async (req, res) => {
+app.patch("/api/users/:id", auth, allowRoles("admin"), async (req, res) => {
   try {
     const roles = manageableRolesFor(req.user.role);
     const user = await User.findById(req.params.id);
@@ -740,7 +740,7 @@ app.patch("/api/users/:id", auth, allowRoles("admin", "owner"), async (req, res)
   }
 });
 
-app.delete("/api/users/:id", auth, allowRoles("admin", "owner"), async (req, res) => {
+app.delete("/api/users/:id", auth, allowRoles("admin"), async (req, res) => {
   try {
     const roles = manageableRolesFor(req.user.role);
     const user = await User.findById(req.params.id);
