@@ -125,12 +125,21 @@ const auditLogSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
 });
 
+const settingSchema = new mongoose.Schema(
+  {
+    key: { type: String, unique: true, required: true },
+    value: { type: mongoose.Schema.Types.Mixed, default: {} },
+  },
+  { timestamps: true }
+);
+
 const User = mongoose.model("User", userSchema);
 const Inventory = mongoose.model("Inventory", inventorySchema);
 const Order = mongoose.model("Order", orderSchema);
 const Alert = mongoose.model("Alert", alertSchema);
 const SupplierDelivery = mongoose.model("SupplierDelivery", supplierDeliverySchema);
 const AuditLog = mongoose.model("AuditLog", auditLogSchema);
+const Setting = mongoose.model("Setting", settingSchema);
 
 /* -------------------------
  * Defaults
@@ -158,6 +167,14 @@ function normalizeUsername(value) {
 
 function normalizeEmail(value) {
   return String(value || "").trim().toLowerCase();
+}
+
+function normalizeSignupCode(value) {
+  return String(value || "").trim().toUpperCase();
+}
+
+function generateSignupCode() {
+  return Math.random().toString(36).slice(2, 10).toUpperCase();
 }
 
 function signToken(user) {
@@ -345,6 +362,16 @@ async function ensureSeedData() {
       passwordHash,
     });
   }
+
+  const existingSignupCode = await Setting.findOne({ key: "staffSignupCode" });
+  if (!existingSignupCode) {
+    await Setting.create({
+      key: "staffSignupCode",
+      value: {
+        code: normalizeSignupCode(process.env.STAFF_SIGNUP_CODE) || generateSignupCode(),
+      },
+    });
+  }
 }
 
 /* -------------------------
@@ -482,13 +509,20 @@ app.post("/api/auth/register", registerLimiter, async (req, res) => {
     const username = normalizeUsername(req.body?.username);
     const email = normalizeEmail(req.body?.email);
     const password = String(req.body?.password || "");
+    const signupCode = normalizeSignupCode(req.body?.signupCode);
 
-    if (!username || !email || !password) {
-      return res.status(400).json({ ok: false, message: "Username, email, and password are required" });
+    if (!username || !email || !password || !signupCode) {
+      return res.status(400).json({ ok: false, message: "Username, email, password, and registration code are required" });
     }
 
     if (password.length < 6) {
       return res.status(400).json({ ok: false, message: "Password must be at least 6 characters" });
+    }
+
+    const codeSetting = await Setting.findOne({ key: "staffSignupCode" });
+    const currentSignupCode = normalizeSignupCode(codeSetting?.value?.code);
+    if (!currentSignupCode || signupCode !== currentSignupCode) {
+      return res.status(403).json({ ok: false, message: "Invalid registration code" });
     }
 
     const usernameTaken = await User.findOne({ username });
@@ -537,6 +571,50 @@ app.post("/api/auth/login", loginLimiter, async (req, res) => {
       token,
       user: { id: user._id, username: user.username, role: user.role, email: user.email },
     });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+app.get("/api/staff-signup-code", auth, allowRoles("admin", "owner"), async (_req, res) => {
+  try {
+    const setting = await Setting.findOneAndUpdate(
+      { key: "staffSignupCode" },
+      { $setOnInsert: { value: { code: generateSignupCode() } } },
+      { new: true, upsert: true }
+    );
+
+    res.json({ ok: true, code: normalizeSignupCode(setting.value?.code) });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+app.patch("/api/staff-signup-code", auth, allowRoles("admin", "owner"), async (req, res) => {
+  try {
+    const requestedCode = normalizeSignupCode(req.body?.code);
+    const nextCode = requestedCode || generateSignupCode();
+
+    if (nextCode.length < 6) {
+      return res.status(400).json({ ok: false, message: "Registration code must be at least 6 characters" });
+    }
+
+    const setting = await Setting.findOneAndUpdate(
+      { key: "staffSignupCode" },
+      { $set: { value: { code: nextCode } } },
+      { new: true, upsert: true }
+    );
+
+    await AuditLog.create({
+      action: "update_staff_signup_code",
+      actor: req.user.username,
+      actorRole: req.user.role,
+      target: "staffSignupCode",
+      details: { changed: true },
+      createdAt: new Date(),
+    });
+
+    res.json({ ok: true, code: normalizeSignupCode(setting.value?.code) });
   } catch (err) {
     res.status(500).json({ ok: false, message: err.message });
   }
