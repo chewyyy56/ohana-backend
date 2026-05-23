@@ -3,6 +3,7 @@
   "private": true,
   "scripts": {
     "reset:data": "node scripts/resetData.js",
+    "seed:sales": "node scripts/seedSalesData.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "version": "1.0.0",

@@ -817,7 +817,7 @@ app.patch("/api/inventory/restock", auth, allowRoles("admin", "owner"), async (r
  * ------------------------- */
 app.get("/api/orders", auth, allowRoles("owner", "admin"), async (_req, res) => {
   try {
-    const orders = await Order.find().sort({ createdAt: -1 }).limit(1000);
+    const orders = await Order.find().sort({ createdAt: -1 }).limit(10000);
     res.json({ ok: true, orders });
   } catch (err) {
     res.status(500).json({ ok: false, message: err.message });
