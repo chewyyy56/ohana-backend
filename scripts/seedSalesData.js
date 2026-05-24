@@ -72,17 +72,17 @@ const ADD_ONS = [
 ];
 
 const HEALTHY_INVENTORY = {
-  coffeeBeans: 28000,
-  matchaPowder: 6500,
-  cocoaPowder: 7500,
-  milk: 52000,
-  sugarSyrup: 26000,
-  condensedMilk: 11000,
-  cups12oz: 420,
-  cups16oz: 460,
-  cups22oz: 360,
-  lids: 1200,
-  straws: 1200,
+  coffeeBeans: 12000,
+  matchaPowder: 3200,
+  cocoaPowder: 3500,
+  milk: 24000,
+  sugarSyrup: 12000,
+  condensedMilk: 5200,
+  cups12oz: 180,
+  cups16oz: 220,
+  cups22oz: 160,
+  lids: 560,
+  straws: 560,
 };
 
 function seededRandom(seed) {
@@ -118,26 +118,26 @@ function ymd(date) {
 }
 
 function ticketCountForDay(date, rand) {
-  const weekdayBase = [18, 8, 10, 11, 13, 19, 24][date.getDay()];
+  const weekdayBase = [8, 3, 4, 5, 6, 9, 12][date.getDay()];
   const month = date.getMonth();
   const day = date.getDate();
-  let multiplier = 0.85 + rand() * 0.35;
+  let multiplier = 0.75 + rand() * 0.45;
 
-  if (date.getDay() === 5 || date.getDay() === 6) multiplier += 0.25;
-  if (day === 15 || day === 30) multiplier += 0.2;
-  if (month === 11 && day >= 15 && day <= 24) multiplier += 0.28;
-  if (month === 11 && day === 25) multiplier = 0.35;
-  if (month === 0 && day === 1) multiplier = 0.25;
-  if (month === 4 && day >= 1 && day <= 12) multiplier += 0.12;
+  if (date.getDay() === 5 || date.getDay() === 6) multiplier += 0.15;
+  if (day === 15 || day === 30) multiplier += 0.12;
+  if (month === 11 && day >= 15 && day <= 24) multiplier += 0.18;
+  if (month === 11 && day === 25) multiplier = 0.25;
+  if (month === 0 && day === 1) multiplier = 0.2;
+  if (month === 4 && day >= 1 && day <= 12) multiplier += 0.08;
 
-  return Math.max(3, Math.round(weekdayBase * multiplier));
+  return Math.max(1, Math.round(weekdayBase * multiplier));
 }
 
 function buildLine(product, rand) {
   const sizes = Object.keys(product.prices);
   const sizeRoll = rand();
   const size = sizes.length === 1 ? sizes[0] : sizeRoll < 0.45 ? "16oz" : sizeRoll < 0.75 ? "12oz" : "22oz";
-  const quantity = rand() < 0.82 ? 1 : 2;
+  const quantity = rand() < 0.92 ? 1 : 2;
   const unitPrice = Number(product.prices[size]);
 
   return {
@@ -165,7 +165,7 @@ function buildSeedOrders(startDate, endDate) {
       const createdAt = new Date(cursor);
       createdAt.setHours(hour, minute, 0, 0);
 
-      const lineCount = rand() < 0.68 ? 1 : rand() < 0.92 ? 2 : 3;
+      const lineCount = rand() < 0.82 ? 1 : rand() < 0.98 ? 2 : 3;
       for (let line = 0; line < lineCount; line++) {
         const product = pickWeighted(PRODUCTS, rand);
         orders.push({
@@ -177,7 +177,7 @@ function buildSeedOrders(startDate, endDate) {
         });
       }
 
-      if (rand() < 0.18) {
+      if (rand() < 0.07) {
         const addon = ADD_ONS[Math.floor(rand() * ADD_ONS.length)];
         orders.push({
           groupId,
@@ -206,13 +206,13 @@ function buildSupplierDeliveries(startDate, endDate) {
   const items = ["Coffee beans and syrups", "Milk and dairy supplies", "Cups, lids, and straws", "Powders and add-ons"];
 
   for (let cursor = new Date(startDate); cursor <= endDate; cursor.setMonth(cursor.getMonth() + 1)) {
-    for (let i = 0; i < 3; i++) {
-      const createdAt = new Date(cursor.getFullYear(), cursor.getMonth(), 3 + i * 9, 10 + i, 0, 0);
+    for (let i = 0; i < 2; i++) {
+      const createdAt = new Date(cursor.getFullYear(), cursor.getMonth(), 5 + i * 14, 10 + i, 0, 0);
       deliveries.push({
         supplier: suppliers[i % suppliers.length],
         item: items[i % items.length],
         qty: 1,
-        cost: Math.round(2800 + rand() * 4200),
+        cost: Math.round(1400 + rand() * 2600),
         createdBy: "admin",
         createdAt,
       });
